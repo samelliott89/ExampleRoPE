@@ -1,0 +1,75 @@
+---
+description: Project context for ExampleRoPE transformer implementation
+globs: ["**/*.py"]
+---
+
+# ExampleRoPE - Transformer Implementation Tutorial
+
+## Project Goal
+Building a minimal transformer from scratch with modern techniques (LLaMA-style), focusing on understanding each component.
+
+## Current State
+
+### Completed Components
+
+**Config** - Centralized hyperparameters:
+- `dim=64` (small for testing; real models use 4096+)
+- `hidden_dim=256` (MLP hidden dimension)
+- `n_heads=8`, `n_kv_heads=4` (GQA with 2 query heads per KV head)
+- `max_seq_len=1024`, `vocab_size=10000`, `dropout=0.1`
+
+**FeedForward** - SwiGLU MLP:
+- Three linear layers (w1, w2, w3), no bias
+- Forward: `w2(silu(w3(x)) * w1(x))`
+- Gating mechanism improves training dynamics
+
+**Attention** - Grouped Query Attention (GQA):
+- Fewer KV heads than Q heads (saves memory during inference)
+- `n_rep = n_heads // n_kv_heads` computed automatically
+- Uses `F.scaled_dot_product_attention` (Flash Attention when available)
+- `_repeat_kv` expands KV heads to match Q heads via broadcast
+
+### In Progress
+The test block has incomplete embedding code:
+```python
+token_embedding = nn.Embedding(config.vocab_size, config.dim)
+position_embedding = nn.Embedding(config.max_seq_len, config.dim)
+x = token_embedding + position_embedding[position]  # <- incomplete
+```
+
+### Not Yet Implemented
+- **RoPE** (Rotary Position Embeddings) - the main goal of this tutorial
+- **RMSNorm** - pre-normalization for each sublayer
+- **TransformerBlock** - combines Attention + FeedForward with residuals
+- **Transformer** - full model with embedding, blocks, and output head
+- **KV Cache** - for efficient autoregressive inference
+
+## Design Patterns
+
+1. **Config dataclass** - all hyperparameters in one place
+2. **No bias** on linear layers (LLaMA convention)
+3. **Detailed shape comments** - e.g. `# (B, T, 8, 8)`
+4. **Test block** at bottom with `if __name__ == "__main__"`
+
+## Shape Reference (with current config)
+```
+B = batch size (e.g., 2)
+T = sequence length (e.g., 10)
+dim = 64
+n_heads = 8, n_kv_heads = 4
+head_dim = dim // n_heads = 8
+
+Input:     (B, T, 64)
+Q:         (B, T, 8, 8)   — 8 query heads
+K, V:      (B, T, 4, 8)   — 4 KV heads (before repeat)
+K, V:      (B, T, 8, 8)   — after _repeat_kv
+Attention: (B, 8, T, 8)   — after transpose
+Output:    (B, T, 64)
+```
+
+## Next Steps (suggested order)
+1. Implement RoPE (apply to Q and K before attention)
+2. Add RMSNorm
+3. Create TransformerBlock (norm → attn → residual → norm → ffn → residual)
+4. Build full Transformer class
+5. Fix the embedding test code
