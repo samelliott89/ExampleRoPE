@@ -8,68 +8,62 @@ globs: ["**/*.py"]
 ## Project Goal
 Building a minimal transformer from scratch with modern techniques (LLaMA-style), focusing on understanding each component.
 
-## Current State
+## Current State - COMPLETE
+
+### Files
+- `model.py` - Full transformer with training loop
+- `data.py` - Tiny Shakespeare dataset + character tokenizer
+- `optimizer.py` - Muon + AdamW optimizers
 
 ### Completed Components
 
 **Config** - Centralized hyperparameters:
-- `dim=64` (small for testing; real models use 4096+)
-- `hidden_dim=256` (MLP hidden dimension)
+- `dim=128`, `hidden_dim=512`, `n_layers=4`
 - `n_heads=8`, `n_kv_heads=4` (GQA with 2 query heads per KV head)
-- `max_seq_len=1024`, `vocab_size=10000`, `dropout=0.1`
+- `max_seq_len=256`, `vocab_size=65` (set from tokenizer)
+- Training: `batch_size=32`, `max_iters=5000`, `learning_rate=3e-4`
 
-**FeedForward** - SwiGLU MLP:
-- Three linear layers (w1, w2, w3), no bias
-- Forward: `w2(silu(w3(x)) * w1(x))`
-- Gating mechanism improves training dynamics
+**RoPE** - Rotary Position Embeddings:
+- `precompute_freqs_cis` - precomputes rotation frequencies
+- `apply_rotary_emb` - applies rotation to Q, K via complex multiplication
 
-**Attention** - Grouped Query Attention (GQA):
-- Fewer KV heads than Q heads (saves memory during inference)
-- `n_rep = n_heads // n_kv_heads` computed automatically
-- Uses `F.scaled_dot_product_attention` (Flash Attention when available)
-- `_repeat_kv` expands KV heads to match Q heads via broadcast
+**RMSNorm** - Root Mean Square Layer Normalization
 
-### In Progress
-The test block has incomplete embedding code:
-```python
-token_embedding = nn.Embedding(config.vocab_size, config.dim)
-position_embedding = nn.Embedding(config.max_seq_len, config.dim)
-x = token_embedding + position_embedding[position]  # <- incomplete
-```
+**FeedForward** - SwiGLU MLP (w1, w2, w3, no bias)
 
-### Not Yet Implemented
-- **RoPE** (Rotary Position Embeddings) - the main goal of this tutorial
-- **RMSNorm** - pre-normalization for each sublayer
-- **TransformerBlock** - combines Attention + FeedForward with residuals
-- **Transformer** - full model with embedding, blocks, and output head
-- **KV Cache** - for efficient autoregressive inference
+**Attention** - Grouped Query Attention with RoPE
+
+**TransformerBlock** - Pre-norm architecture: norm → attn → residual → norm → ffn → residual
+
+**Transformer** - Full model with tok_embeddings, layers, output projection
+
+**Training**:
+- `train()` - full training loop with lr warmup/decay
+- `estimate_loss()` - evaluate on train/val
+- `generate()` - autoregressive text generation
+
+**Data** (`data.py`):
+- Downloads Tiny Shakespeare (~1MB)
+- Character-level tokenizer (65 chars)
+- 90/10 train/val split
+- `TextDataset.get_batch()` for random sequence sampling
 
 ## Design Patterns
 
 1. **Config dataclass** - all hyperparameters in one place
 2. **No bias** on linear layers (LLaMA convention)
-3. **Detailed shape comments** - e.g. `# (B, T, 8, 8)`
-4. **Test block** at bottom with `if __name__ == "__main__"`
+3. **Pre-norm** architecture (norm before attention/ffn)
+4. **Cosine LR decay** with warmup
 
-## Shape Reference (with current config)
-```
-B = batch size (e.g., 2)
-T = sequence length (e.g., 10)
-dim = 64
-n_heads = 8, n_kv_heads = 4
-head_dim = dim // n_heads = 8
+## Running
 
-Input:     (B, T, 64)
-Q:         (B, T, 8, 8)   — 8 query heads
-K, V:      (B, T, 4, 8)   — 4 KV heads (before repeat)
-K, V:      (B, T, 8, 8)   — after _repeat_kv
-Attention: (B, 8, T, 8)   — after transpose
-Output:    (B, T, 64)
+```bash
+python model.py  # trains and generates sample
+python data.py   # test data loading
 ```
 
-## Next Steps (suggested order)
-1. Implement RoPE (apply to Q and K before attention)
-2. Add RMSNorm
-3. Create TransformerBlock (norm → attn → residual → norm → ffn → residual)
-4. Build full Transformer class
-5. Fix the embedding test code
+## Possible Extensions
+- KV Cache for faster inference
+- Gradient checkpointing for longer sequences
+- Mixed precision training (fp16/bf16)
+- Save/load checkpoints

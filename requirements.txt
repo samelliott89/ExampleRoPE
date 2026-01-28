@@ -1,1 +1,4 @@
 torch
+tiktoken
+wandb
+python-dotenv
