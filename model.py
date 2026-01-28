@@ -233,6 +233,7 @@ if __name__ == "__main__":
     # Create model
     transformer = Transformer(config)
     model = transformer
+    model = torch.compile(model, backend="aot_eager") # swap between aot_eager and max-autotune, reduce-overhead
     model.to(device)
     
     # Test forward pass
