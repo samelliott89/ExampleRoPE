@@ -1,0 +1,8 @@
+/home/sam/Personal/SamTutorials/ExampleRoPE/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:2156: UserWarning: Torchinductor does not support code generation for complex operators. Performance may be worse than eager.
+  warnings.warn(
+epoch  1 | batch    0/76 | loss 10.9822 | lr 3.95e-06
+epoch  1 | batch   10/76 | loss 10.9914 | lr 4.34e-05
+epoch  1 | batch   20/76 | loss 10.9666 | lr 8.29e-05
+epoch  1 | batch   30/76 | loss 10.9230 | lr 1.22e-04
+epoch  1 | batch   40/76 | loss 10.8544 | lr 1.62e-04
+epoch  1 | batch   50/76 | loss 10.7466 | lr 2.01e-04
