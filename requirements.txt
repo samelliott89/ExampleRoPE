@@ -2,4 +2,5 @@ torch
 tiktoken
 wandb
 python-dotenv
+datasets
 ruff

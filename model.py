@@ -1,14 +1,59 @@
 import math
 import os
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from dataclasses import dataclass, asdict
+
+import wandb
 from optimizer import get_optimizer, Muon
 from data import load_dataset
-import wandb
+
+
+# --- KV Cache ---
+
+
+@dataclass
+class KVCache:
+    """Cache for key-value tensors during autoregressive generation."""
+    k: torch.Tensor  # (B, n_kv_heads, cached_len, head_dim)
+    v: torch.Tensor  # (B, n_kv_heads, cached_len, head_dim)
+    
+    @staticmethod
+    def empty(
+        batch_size: int,
+        n_kv_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> "KVCache":
+        """Create empty cache."""
+        return KVCache(
+            k=torch.empty(batch_size, n_kv_heads, 0, head_dim, device=device, dtype=dtype),
+            v=torch.empty(batch_size, n_kv_heads, 0, head_dim, device=device, dtype=dtype),
+        )
+    
+    def update(
+        self, k_new: torch.Tensor, v_new: torch.Tensor, max_len: Optional[int] = None
+    ) -> "KVCache":
+        """Append new K,V and optionally apply sliding window."""
+        k = torch.cat([self.k, k_new], dim=2)
+        v = torch.cat([self.v, v_new], dim=2)
+        
+        # Sliding window: keep only last max_len positions
+        if max_len is not None and k.size(2) > max_len:
+            k = k[:, :, -max_len:, :]
+            v = v[:, :, -max_len:, :]
+        
+        return KVCache(k=k, v=v)
+    
+    @property
+    def seq_len(self) -> int:
+        return self.k.size(2)
 
 
 def setup_distributed():
@@ -46,23 +91,25 @@ class Config:
     n_kv_heads: int = 6  # GQA: 2 query heads per KV head (half as many KV heads)
     n_layers: int = 12
     rope_theta: float = 10000.0
+    sliding_window: Optional[int] = None  # None = full attention, int = window size
 
     # Training (optimized for 92GB VRAM)
-    batch_size: int = 64  # reduced - activations use most VRAM, not params
+    batch_size: int = 64
     learning_rate: float = 6e-4
     weight_decay: float = 0.1
-    epochs: int = 20
-    warmup_ratio: float = 0.1  # 10% of training for warmup
+    epochs: int = 50  # increased for longer training
+    warmup_ratio: float = 0.05  # 5% warmup (faster ramp)
     min_lr: float = 6e-5
     grad_clip: float = 1.0
     use_amp: bool = True  # mixed precision (bf16)
     gradient_checkpointing: bool = True  # trade compute for memory
-
-    # Logging
+    
+    # Logging & Checkpoints
     log_interval: int = 10  # log every N batches
-    eval_interval: int = 1  # eval every N epochs
-    use_wandb: bool = True  # enable wandb logging
-    wandb_project: str = "example-rope"  # wandb project name
+    eval_interval: int = 5  # eval every N epochs
+    save_interval: int = 10  # save checkpoint every N epochs
+    use_wandb: bool = True
+    wandb_project: str = "example-rope"
 
 
 # --- RoPE ---
@@ -79,8 +126,15 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(
-    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    start_pos: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embeddings. start_pos offsets for cached generation."""
+    seq_len = q.size(1)
+    freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
+    
     q_complex = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
     k_complex = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
@@ -123,36 +177,81 @@ class Attention(nn.Module):
         self.n_kv_heads = config.n_kv_heads
         self.n_rep = config.n_heads // config.n_kv_heads
         self.head_dim = config.dim // config.n_heads
+        self.sliding_window = config.sliding_window
 
         self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[KVCache] = None,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, Optional[KVCache]]:
+        """
+        Forward pass with optional KV cache.
+        
+        Args:
+            x: Input tensor (B, T, dim) - during cached gen, T=1
+            freqs_cis: RoPE frequencies (full sequence length)
+            cache: Optional KV cache from previous forward passes
+            start_pos: Position offset for RoPE (= cache.seq_len if using cache)
+        
+        Returns:
+            output: (B, T, dim)
+            new_cache: Updated cache (or None if not using cache)
+        """
         B, T, _ = x.shape
+        
+        # Project to Q, K, V
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
 
-        q, k = apply_rotary_emb(q, k, freqs_cis)
+        # Apply RoPE with position offset
+        q, k = apply_rotary_emb(q, k, freqs_cis, start_pos)
+        
+        # Transpose for attention: (B, n_heads, T, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
+        # Handle cache
+        new_cache = None
+        if cache is not None:
+            # Concat with cached K, V (apply sliding window if set)
+            new_cache = cache.update(k, v, max_len=self.sliding_window)
+            k, v = new_cache.k, new_cache.v
+        
+        # Expand KV heads for GQA
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Compute attention
+        # is_causal=True only works when q_len == k_len (no cache)
+        # With cache, we need a custom mask or just use is_causal=False since
+        # the new token should attend to all cached + current tokens
+        if cache is not None:
+            # Single token attending to full cached sequence - no causal mask needed
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.wo(out)
+        return self.wo(out), new_cache
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand KV heads for GQA. x: (B, n_kv_heads, T, head_dim)"""
         if self.n_rep == 1:
             return x
-        B, T, n_kv, head_dim = x.shape
+        B, n_kv, T, head_dim = x.shape
         return (
-            x[:, :, :, None, :]
-            .expand(B, T, n_kv, self.n_rep, head_dim)
-            .reshape(B, T, self.n_heads, head_dim)
+            x[:, :, None, :, :]
+            .expand(B, n_kv, self.n_rep, T, head_dim)
+            .reshape(B, self.n_heads, T, head_dim)
         )
 
 
@@ -165,24 +264,40 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim)
         self.use_checkpoint = config.gradient_checkpointing
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[KVCache] = None,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, Optional[KVCache]]:
+        # Gradient checkpointing only during training (no cache)
         if self.use_checkpoint and self.training:
-            x = x + torch.utils.checkpoint.checkpoint(
+            attn_out, _ = torch.utils.checkpoint.checkpoint(
                 self._attn_forward,
                 self.attention_norm(x),
                 freqs_cis,
+                None,  # no cache during training
+                0,
                 use_reentrant=False,
             )
+            x = x + attn_out
             x = x + torch.utils.checkpoint.checkpoint(
                 self._ffn_forward, self.ffn_norm(x), use_reentrant=False
             )
+            return x, None
         else:
-            x = x + self.attention(self.attention_norm(x), freqs_cis)
+            attn_out, new_cache = self.attention(
+                self.attention_norm(x), freqs_cis, cache, start_pos
+            )
+            x = x + attn_out
             x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+            return x, new_cache
 
-    def _attn_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        return self.attention(x, freqs_cis)
+    def _attn_forward(
+        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[KVCache], start_pos: int
+    ) -> tuple[torch.Tensor, Optional[KVCache]]:
+        return self.attention(x, freqs_cis, cache, start_pos)
 
     def _ffn_forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.feed_forward(x)
@@ -206,14 +321,37 @@ class Transformer(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis)
 
     def forward(
-        self, tokens: torch.Tensor, targets: torch.Tensor = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        tokens: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        caches: Optional[list[KVCache]] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[list[KVCache]]]:
+        """
+        Forward pass with optional KV cache for efficient generation.
+        
+        Args:
+            tokens: Input token IDs (B, T)
+            targets: Target token IDs for loss computation (B, T)
+            caches: List of KVCache per layer (for incremental decoding)
+        
+        Returns:
+            logits: (B, T, vocab_size)
+            loss: Cross-entropy loss if targets provided
+            new_caches: Updated caches if caches were provided
+        """
         B, T = tokens.shape
         x = self.tok_embeddings(tokens)
-        freqs_cis = self.freqs_cis[:T]
-
-        for layer in self.layers:
-            x = layer(x, freqs_cis)
+        
+        # Compute start position from cache
+        start_pos = 0 if caches is None else caches[0].seq_len
+        
+        new_caches = [] if caches is not None else None
+        
+        for i, layer in enumerate(self.layers):
+            layer_cache = caches[i] if caches is not None else None
+            x, new_cache = layer(x, self.freqs_cis, layer_cache, start_pos)
+            if new_caches is not None:
+                new_caches.append(new_cache)
 
         x = self.norm(x)
         logits = self.output(x)
@@ -222,7 +360,17 @@ class Transformer(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss
+        return logits, loss, new_caches
+    
+    def init_caches(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16
+    ) -> list[KVCache]:
+        """Initialize empty KV caches for all layers."""
+        head_dim = self.config.dim // self.config.n_heads
+        return [
+            KVCache.empty(batch_size, self.config.n_kv_heads, head_dim, device, dtype)
+            for _ in range(self.config.n_layers)
+        ]
 
 
 # --- Learning Rate Scheduler ---
@@ -253,7 +401,7 @@ def estimate_loss(model, train_ds, val_ds, config: Config, eval_batches: int = 5
         for _ in range(eval_batches):
             x, y = ds.get_batch(config.batch_size)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=config.use_amp):
-                _, loss = model(x, y)
+                _, loss, _ = model(x, y)  # ignore caches
             total_loss += loss.item()
         losses[name] = total_loss / eval_batches
     model.train()
@@ -294,7 +442,11 @@ def train(config: Config):
             project=config.wandb_project,
             config=asdict(config) | {"n_params": n_params, "device": str(device), "world_size": world_size},
         )
-        wandb.watch(model, log="gradients", log_freq=100)
+        # wandb.watch(model, log="gradients", log_freq=100)  # disabled - can cause DDP hangs
+    
+    # Sync all processes before training
+    if world_size > 1:
+        dist.barrier()
 
     # Get optimizers (Muon for matrices, AdamW for norms)
     optimizers = get_optimizer(model, config)
@@ -322,7 +474,7 @@ def train(config: Config):
 
             # Forward pass with mixed precision
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=config.use_amp):
-                logits, loss = model(x, y)
+                logits, loss, _ = model(x, y)  # no cache during training
 
             # Backward pass
             for opt in optimizers:
@@ -371,6 +523,20 @@ def train(config: Config):
                     "eval/val_loss": losses["val"],
                     "eval/epoch": epoch + 1,
                 })
+        
+        # Periodic checkpoint saving
+        if (epoch + 1) % config.save_interval == 0 and is_main:
+            os.makedirs("checkpoints", exist_ok=True)
+            model_to_save = model.module if hasattr(model, "module") else model
+            checkpoint = {
+                "model": model_to_save.state_dict(),
+                "config": config,
+                "epoch": epoch + 1,
+                "loss": avg_loss,
+            }
+            ckpt_path = f"checkpoints/model_epoch{epoch + 1:03d}.pt"
+            torch.save(checkpoint, ckpt_path)
+            print(f"Saved checkpoint to {ckpt_path}")
 
     # Save final checkpoint (main process only)
     if is_main:
@@ -398,25 +564,62 @@ def train(config: Config):
 
 @torch.no_grad()
 def generate(
-    model, tokenizer, prompt: str, max_tokens: int = 100, temperature: float = 0.8
+    model,
+    tokenizer,
+    prompt: str,
+    max_tokens: int = 100,
+    temperature: float = 0.8,
+    use_cache: bool = True,
 ):
-    """Generate text from a prompt."""
+    """
+    Generate text from a prompt.
+    
+    Args:
+        model: Transformer model (can be DDP-wrapped)
+        tokenizer: Tokenizer for encoding/decoding
+        prompt: Input text prompt
+        max_tokens: Maximum number of tokens to generate
+        temperature: Sampling temperature (higher = more random)
+        use_cache: Use KV cache for faster generation (default True)
+    """
     # Unwrap DDP if needed
     unwrapped = model.module if hasattr(model, "module") else model
     model.eval()
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     tokens = torch.tensor(
         tokenizer.encode(prompt), dtype=torch.long, device=device
-    ).unsqueeze(0)
-
-    for _ in range(max_tokens):
-        tokens_crop = tokens[:, -unwrapped.config.max_seq_len :]
+    ).unsqueeze(0)  # (1, prompt_len)
+    
+    if use_cache:
+        # Initialize KV cache
+        caches = unwrapped.init_caches(1, device, amp_dtype)
+        
+        # Prefill: process entire prompt at once
         with torch.amp.autocast("cuda", dtype=amp_dtype):
-            logits, _ = model(tokens_crop)
-        logits = logits[:, -1, :] / temperature
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        tokens = torch.cat([tokens, next_token], dim=1)
+            logits, _, caches = model(tokens, caches=caches)
+        
+        # Generate tokens one at a time with cache
+        for _ in range(max_tokens):
+            # Sample next token from last position
+            next_logits = logits[:, -1, :] / temperature
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
+            tokens = torch.cat([tokens, next_token], dim=1)
+            
+            # Forward only the new token, using cache
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                logits, _, caches = model(next_token, caches=caches)
+    else:
+        # Original behavior: no cache, recompute everything each step
+        for _ in range(max_tokens):
+            tokens_crop = tokens[:, -unwrapped.config.max_seq_len:]
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                logits, _, _ = model(tokens_crop)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            tokens = torch.cat([tokens, next_token], dim=1)
 
     return tokenizer.decode(tokens[0].tolist())
 
