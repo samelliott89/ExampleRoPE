@@ -1,5 +1,6 @@
 .venv/
 venv/
+.cursor/
 __pycache__/
 data/
 checkpoints/
