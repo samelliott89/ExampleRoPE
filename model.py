@@ -3,19 +3,36 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from dataclasses import dataclass, asdict
 from optimizer import get_optimizer, Muon
 from data import load_dataset
 import wandb
 
-device = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
-print(f"Using device: {device}")
+
+def setup_distributed():
+    """Initialize distributed training if available."""
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        return rank, world_size, device
+    else:
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
+        return 0, 1, device  # single GPU fallback
+
+
+rank, world_size, device = setup_distributed()
+is_main = rank == 0
+if is_main:
+    print(f"Using device: {device}, World size: {world_size}")
 
 
 @dataclass
@@ -251,29 +268,31 @@ def train(config: Config):
     # Create model
     model = Transformer(config).to(device)
     model = torch.compile(model)  # fused kernels, ~1.5-2x speedup
+    
+    # Wrap in DDP if distributed
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+    
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+    if is_main:
+        print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
 
     # Calculate training steps
     batches_per_epoch = train_ds.batches_per_epoch(config.batch_size)
     total_steps = config.epochs * batches_per_epoch
     warmup_steps = int(total_steps * config.warmup_ratio)
 
-    print(
-        f"Training: {config.epochs} epochs, {batches_per_epoch} batches/epoch, {total_steps} total steps"
-    )
-    print(
-        f"Batch size: {config.batch_size}, Tokens/batch: {config.batch_size * config.max_seq_len:,}"
-    )
-    print(
-        f"Mixed precision: {config.use_amp}, Gradient checkpointing: {config.gradient_checkpointing}"
-    )
+    if is_main:
+        print(f"Training: {config.epochs} epochs, {batches_per_epoch} batches/epoch, {total_steps} total steps")
+        print(f"Batch size: {config.batch_size} (x{world_size} GPUs = {config.batch_size * world_size} effective)")
+        print(f"Tokens/batch: {config.batch_size * config.max_seq_len * world_size:,}")
+        print(f"Mixed precision: {config.use_amp}, Gradient checkpointing: {config.gradient_checkpointing}")
 
-    # Initialize wandb
-    if config.use_wandb:
+    # Initialize wandb (main process only)
+    if config.use_wandb and is_main:
         wandb.init(
             project=config.wandb_project,
-            config=asdict(config) | {"n_params": n_params, "device": str(device)},
+            config=asdict(config) | {"n_params": n_params, "device": str(device), "world_size": world_size},
         )
         wandb.watch(model, log="gradients", log_freq=100)
 
@@ -326,53 +345,53 @@ def train(config: Config):
             n_batches += 1
             global_step += 1
 
-            # Logging
-            if batch_idx % config.log_interval == 0:
-                print(
-                    f"epoch {epoch + 1:2d} | batch {batch_idx:4d}/{batches_per_epoch} | loss {loss.item():.4f} | lr {lr:.2e}"
-                )
+            # Logging (main process only)
+            if batch_idx % config.log_interval == 0 and is_main:
+                print(f"epoch {epoch + 1:2d} | batch {batch_idx:4d}/{batches_per_epoch} | loss {loss.item():.4f} | lr {lr:.2e}")
                 if config.use_wandb:
-                    wandb.log(
-                        {
-                            "train/loss": loss.item(),
-                            "train/lr": lr,
-                            "train/epoch": epoch + batch_idx / batches_per_epoch,
-                            "train/step": global_step,
-                        }
-                    )
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/lr": lr,
+                        "train/epoch": epoch + batch_idx / batches_per_epoch,
+                        "train/step": global_step,
+                    })
 
         # End of epoch
         avg_loss = epoch_loss / n_batches
-        print(f"epoch {epoch + 1:2d} | avg train loss: {avg_loss:.4f}")
+        if is_main:
+            print(f"epoch {epoch + 1:2d} | avg train loss: {avg_loss:.4f}")
 
-        # Evaluation
-        if (epoch + 1) % config.eval_interval == 0:
+        # Evaluation (main process only)
+        if (epoch + 1) % config.eval_interval == 0 and is_main:
             losses = estimate_loss(model, train_ds, val_ds, config)
-            print(
-                f"epoch {epoch + 1:2d} | eval - train: {losses['train']:.4f}, val: {losses['val']:.4f}"
-            )
+            print(f"epoch {epoch + 1:2d} | eval - train: {losses['train']:.4f}, val: {losses['val']:.4f}")
             if config.use_wandb:
-                wandb.log(
-                    {
-                        "eval/train_loss": losses["train"],
-                        "eval/val_loss": losses["val"],
-                        "eval/epoch": epoch + 1,
-                    }
-                )
+                wandb.log({
+                    "eval/train_loss": losses["train"],
+                    "eval/val_loss": losses["val"],
+                    "eval/epoch": epoch + 1,
+                })
 
-    # Save final checkpoint
-    os.makedirs("checkpoints", exist_ok=True)
-    checkpoint = {
-        "model": model.state_dict(),
-        "config": config,
-        "final_loss": avg_loss,
-    }
-    torch.save(checkpoint, "checkpoints/model.pt")
-    print("Saved checkpoint to checkpoints/model.pt")
+    # Save final checkpoint (main process only)
+    if is_main:
+        os.makedirs("checkpoints", exist_ok=True)
+        # Get underlying model if wrapped in DDP
+        model_to_save = model.module if hasattr(model, "module") else model
+        checkpoint = {
+            "model": model_to_save.state_dict(),
+            "config": config,
+            "final_loss": avg_loss,
+        }
+        torch.save(checkpoint, "checkpoints/model.pt")
+        print("Saved checkpoint to checkpoints/model.pt")
 
     # Finish wandb run
-    if config.use_wandb:
+    if config.use_wandb and is_main:
         wandb.finish()
+    
+    # Cleanup distributed
+    if world_size > 1:
+        dist.destroy_process_group()
 
     return model, tokenizer
 
@@ -382,6 +401,8 @@ def generate(
     model, tokenizer, prompt: str, max_tokens: int = 100, temperature: float = 0.8
 ):
     """Generate text from a prompt."""
+    # Unwrap DDP if needed
+    unwrapped = model.module if hasattr(model, "module") else model
     model.eval()
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     tokens = torch.tensor(
@@ -389,7 +410,7 @@ def generate(
     ).unsqueeze(0)
 
     for _ in range(max_tokens):
-        tokens_crop = tokens[:, -model.config.max_seq_len :]
+        tokens_crop = tokens[:, -unwrapped.config.max_seq_len :]
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             logits, _ = model(tokens_crop)
         logits = logits[:, -1, :] / temperature
@@ -411,18 +432,19 @@ if __name__ == "__main__":
     # Train
     model, tokenizer = train(config)
 
-    # Generate samples
-    print("\n" + "=" * 60)
-    print("GENERATION SAMPLES")
-    print("=" * 60)
+    # Generate samples (main process only)
+    if is_main:
+        print("\n" + "=" * 60)
+        print("GENERATION SAMPLES")
+        print("=" * 60)
 
-    prompts = [
-        "It was a dark and stormy night",
-        "The door opened slowly, and",
-        "She looked at him with",
-    ]
+        prompts = [
+            "It was a dark and stormy night",
+            "The door opened slowly, and",
+            "She looked at him with",
+        ]
 
-    for prompt in prompts:
-        print(f"\n--- Prompt: '{prompt}' ---")
-        output = generate(model, tokenizer, prompt, max_tokens=300, temperature=0.8)
-        print(output)
+        for prompt in prompts:
+            print(f"\n--- Prompt: '{prompt}' ---")
+            output = generate(model, tokenizer, prompt, max_tokens=300, temperature=0.8)
+            print(output)

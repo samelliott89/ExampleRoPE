@@ -21,8 +21,14 @@ cp .env.example .env  # add WANDB_API_KEY
 ## Run
 
 ```bash
-python model.py  # trains on Project Gutenberg, saves to checkpoints/
+# Single GPU
+python model.py
+
+# Multi-GPU (4 GPUs)
+torchrun --nproc_per_node=4 model.py
 ```
+
+Trains on Project Gutenberg, saves to `checkpoints/model.pt`.
 
 ## Config
 

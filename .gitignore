@@ -3,5 +3,7 @@ venv/
 __pycache__/
 data/
 checkpoints/
-.env
+vast_checkpoints/
 wandb/
+.env
+vast.config
