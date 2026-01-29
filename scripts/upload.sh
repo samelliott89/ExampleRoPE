@@ -20,6 +20,7 @@ rsync -avz --progress \
     -e "ssh -p $VAST_PORT" \
     --exclude '.venv/' \
     --exclude 'venv/' \
+    --exclude '.cursor/' \
     --exclude '__pycache__/' \
     --exclude '.git/' \
     --exclude 'data/' \
@@ -27,6 +28,7 @@ rsync -avz --progress \
     --exclude 'vast_checkpoints/' \
     --exclude 'wandb/' \
     --exclude '*.pyc' \
+    --exclude 'vast.config' \
     "$PROJECT_DIR/" \
     "$VAST_HOST:$REMOTE_DIR/"
 
