@@ -192,6 +192,11 @@ def download_fineweb_edu(num_samples: int = 100000) -> str:
     """Download FineWeb-Edu sample and return combined text."""
     from datasets import load_dataset as hf_load_dataset
     
+    # Use HF token if available (set HF_TOKEN in .env for faster downloads)
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        print("Using HuggingFace token for faster downloads")
+    
     print(f"Loading FineWeb-Edu ({num_samples:,} samples)...")
     
     # Load streaming dataset and take a sample
@@ -199,7 +204,8 @@ def download_fineweb_edu(num_samples: int = 100000) -> str:
         "HuggingFaceFW/fineweb-edu",
         name="sample-10BT",  # 10B token sample
         split="train",
-        streaming=True
+        streaming=True,
+        token=hf_token,
     )
     
     texts = []
@@ -264,7 +270,7 @@ def load_dataset_fineweb(
 
 # Change this to switch datasets
 ACTIVE_DATASET = DatasetType.FINEWEB_EDU
-FINEWEB_SAMPLES = 100000  # ~50M tokens
+FINEWEB_SAMPLES = 1000000  # ~1B tokens
 
 
 def load_dataset(seq_len: int, device: str = "cpu") -> tuple[TextDataset, TextDataset, Tokenizer]:

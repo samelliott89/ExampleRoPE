@@ -83,21 +83,22 @@ if is_main:
 @dataclass
 class Config:
     # Model (roughly 125M params - similar to GPT-2 small)
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
     vocab_size: int = 50257  # GPT-2 BPE vocab size (set from tokenizer)
-    dim: int = 768
-    hidden_dim: int = 3072  # 4x dim
-    n_heads: int = 12
-    n_kv_heads: int = 6  # GQA: 2 query heads per KV head (half as many KV heads)
-    n_layers: int = 12
+    dim: int = 512
+    hidden_dim: int = 2048  # 4x dim
+    n_heads: int = 8
+    n_kv_heads: int = 4  # GQA: 2 query heads per KV head
+    n_layers: int = 8
+    logit_softcap: float = 30.0  # cap logits to [-30, 30] for stability
     rope_theta: float = 10000.0
     sliding_window: Optional[int] = None  # None = full attention, int = window size
 
-    # Training (optimized for 92GB VRAM)
-    batch_size: int = 64
-    learning_rate: float = 6e-4
+    # Training
+    batch_size: int = 256  # large batch for H100s
+    learning_rate: float = 1e-3  # higher lr for smaller model
     weight_decay: float = 0.1
-    epochs: int = 50  # increased for longer training
+    epochs: int = 10  # 10 epochs with 500M tokens
     warmup_ratio: float = 0.05  # 5% warmup (faster ramp)
     min_lr: float = 6e-5
     grad_clip: float = 1.0
@@ -107,9 +108,10 @@ class Config:
     # Logging & Checkpoints
     log_interval: int = 10  # log every N batches
     eval_interval: int = 5  # eval every N epochs
-    save_interval: int = 10  # save checkpoint every N epochs
+    save_interval: int = 5  # save checkpoint every N epochs
     use_wandb: bool = True
     wandb_project: str = "example-rope"
+    resume_from: str = ""  # path to checkpoint to resume from (e.g., "checkpoints/model_epoch005.pt")
 
 
 # --- RoPE ---
@@ -183,6 +185,10 @@ class Attention(nn.Module):
         self.wk = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        
+        # QK-Norm: normalize queries and keys for stability
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
 
     def forward(
         self,
@@ -210,6 +216,10 @@ class Attention(nn.Module):
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
+
+        # QK-Norm: normalize queries and keys for stability
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE with position offset
         q, k = apply_rotary_emb(q, k, freqs_cis, start_pos)
@@ -355,6 +365,10 @@ class Transformer(nn.Module):
 
         x = self.norm(x)
         logits = self.output(x)
+        
+        # Logit softcap: prevent extreme values for stability
+        if self.config.logit_softcap > 0:
+            logits = self.config.logit_softcap * torch.tanh(logits / self.config.logit_softcap)
 
         loss = None
         if targets is not None:
@@ -415,6 +429,22 @@ def train(config: Config):
 
     # Create model
     model = Transformer(config).to(device)
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if config.resume_from and os.path.exists(config.resume_from):
+        if is_main:
+            print(f"Resuming from {config.resume_from}")
+        ckpt = torch.load(config.resume_from, map_location=device, weights_only=False)
+        state_dict = ckpt["model"]
+        # Handle torch.compile'd models (keys may have _orig_mod prefix)
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        start_epoch = ckpt.get("epoch", 0)
+        if is_main:
+            print(f"Loaded weights from epoch {start_epoch}, loss was {ckpt.get('loss', 'N/A')}")
+    
     model = torch.compile(model)  # fused kernels, ~1.5-2x speedup
     
     # Wrap in DDP if distributed
@@ -424,6 +454,7 @@ def train(config: Config):
     n_params = sum(p.numel() for p in model.parameters())
     if is_main:
         print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+        print(f"[v4] dim={config.dim}, layers={config.n_layers}, QK-Norm, softcap={config.logit_softcap}")
 
     # Calculate training steps
     batches_per_epoch = train_ds.batches_per_epoch(config.batch_size)
@@ -461,7 +492,7 @@ def train(config: Config):
     global_step = 0
     model.train()
 
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         epoch_loss = 0.0
         n_batches = 0
 
