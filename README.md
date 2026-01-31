@@ -71,7 +71,7 @@ python inference.py --checkpoint checkpoints/model.pt --eval
 
 - `model.py` - Model architecture + training loop
 - `inference.py` - Text generation and perplexity evaluation
-- `data.py` - FineWeb-Edu/Gutenberg dataset + GPT-2 BPE tokenizer
+- `data.py` - FineWeb-Edu dataset + GPT-2 BPE tokenizer
 - `optimizer.py` - Muon + AdamW optimizer
 
 
