@@ -14,9 +14,6 @@ from optimizer import get_optimizer, Muon
 from data import load_dataset
 
 
-# --- KV Cache ---
-
-
 @dataclass
 class KVCache:
     """Cache for key-value tensors during autoregressive generation."""
@@ -114,9 +111,6 @@ class Config:
     resume_from: str = ""  # path to checkpoint to resume from (e.g., "checkpoints/model_epoch005.pt")
 
 
-# --- RoPE ---
-
-
 def precompute_freqs_cis(
     dim: int, seq_len: int, theta: float = 10000.0
 ) -> torch.Tensor:
@@ -145,9 +139,6 @@ def apply_rotary_emb(
     q_out = torch.view_as_real(q_out).flatten(-2)
     k_out = torch.view_as_real(k_out).flatten(-2)
     return q_out.type_as(q), k_out.type_as(k)
-
-
-# --- Model Components ---
 
 
 class RMSNorm(nn.Module):
@@ -387,9 +378,6 @@ class Transformer(nn.Module):
         ]
 
 
-# --- Learning Rate Scheduler ---
-
-
 def get_lr(step: int, total_steps: int, warmup_steps: int, config: Config) -> float:
     """Cosine decay with warmup."""
     if step < warmup_steps:
@@ -399,9 +387,6 @@ def get_lr(step: int, total_steps: int, warmup_steps: int, config: Config) -> fl
     decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
-
-
-# --- Training ---
 
 
 @torch.no_grad()
@@ -454,7 +439,6 @@ def train(config: Config):
     n_params = sum(p.numel() for p in model.parameters())
     if is_main:
         print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
-        print(f"[v4] dim={config.dim}, layers={config.n_layers}, QK-Norm, softcap={config.logit_softcap}")
 
     # Calculate training steps
     batches_per_epoch = train_ds.batches_per_epoch(config.batch_size)
@@ -473,7 +457,6 @@ def train(config: Config):
             project=config.wandb_project,
             config=asdict(config) | {"n_params": n_params, "device": str(device), "world_size": world_size},
         )
-        # wandb.watch(model, log="gradients", log_freq=100)  # disabled - can cause DDP hangs
     
     # Sync all processes before training
     if world_size > 1:

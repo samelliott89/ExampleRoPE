@@ -1,15 +1,35 @@
 # ExampleRoPE
 
-Minimal transformer implementation with modern techniques (LLaMA-style).
+Minimal transformer implementation with modern techniques (LLaMA/Gemma-style). Trained on vast.ai with H100 GPUs.
 
 ## Features
 
 - **RoPE** - Rotary Position Embeddings
-- **GQA** - Grouped Query Attention (configurable KV heads)
-- **SwiGLU** - Gated MLP
+- **GQA** - Grouped Query Attention (8 query heads, 4 KV heads)
+- **QK-Norm** - Query/Key normalization for stability
+- **SwiGLU** - Gated MLP activation
 - **RMSNorm** - Pre-normalization
+- **Logit Softcap** - Caps logits to prevent instability
+- **Muon + AdamW** - Orthogonalized momentum for matrices, AdamW for norms
 - Mixed precision (bf16), gradient checkpointing, torch.compile
+- KV cache for efficient generation
 - Wandb logging
+
+## Model Config (~80M params)
+
+| Param | Value |
+|-------|-------|
+| dim | 512 |
+| hidden_dim | 2048 |
+| n_layers | 8 |
+| n_heads | 8 |
+| n_kv_heads | 4 |
+| max_seq_len | 512 |
+| logit_softcap | 30.0 |
+
+## Training
+
+Trained on FineWeb-Edu (1M samples, ~1B tokens) for 10 epochs on 2x H100 GPUs via vast.ai.
 
 ## Setup
 
@@ -24,27 +44,25 @@ cp .env.example .env  # add WANDB_API_KEY
 # Single GPU
 python model.py
 
-# Multi-GPU (4 GPUs)
+# Multi-GPU
 torchrun --nproc_per_node=4 model.py
 ```
 
-Trains on Project Gutenberg, saves to `checkpoints/model.pt`.
+Saves checkpoints to `checkpoints/`.
 
-## Config
+## Inference
 
-Edit `Config` in `model.py`:
+```bash
+# Generate text
+python inference.py --checkpoint checkpoints/model.pt --prompt "Once upon a time"
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| dim | 768 | Model dimension |
-| n_layers | 12 | Transformer blocks |
-| n_heads | 12 | Query heads |
-| n_kv_heads | 6 | KV heads (GQA) |
-| batch_size | 128 | Batch size |
-| epochs | 20 | Training epochs |
+# Evaluate perplexity
+python inference.py --checkpoint checkpoints/model.pt --eval
+```
 
 ## Files
 
-- `model.py` - Model + training loop
-- `data.py` - Gutenberg dataset + BPE tokenizer
-- `optimizer.py` - Muon + AdamW
+- `model.py` - Model architecture + training loop
+- `inference.py` - Text generation and perplexity evaluation
+- `data.py` - FineWeb-Edu/Gutenberg dataset + GPT-2 BPE tokenizer
+- `optimizer.py` - Muon + AdamW optimizer

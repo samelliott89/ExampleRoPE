@@ -70,8 +70,6 @@ class TextDataset:
         return self.n_seqs // batch_size
 
 
-# --- Gutenberg Dataset ---
-
 GUTENBERG_BOOKS = [
     ("84", "Frankenstein"),
     ("1342", "Pride and Prejudice"),
@@ -186,8 +184,6 @@ def load_dataset_gutenberg(
     )
 
 
-# --- FineWeb-Edu Dataset ---
-
 def download_fineweb_edu(num_samples: int = 100000) -> str:
     """Download FineWeb-Edu sample and return combined text."""
     from datasets import load_dataset as hf_load_dataset
@@ -265,8 +261,6 @@ def load_dataset_fineweb(
     
     return train_dataset, val_dataset, tokenizer
 
-
-# --- Main Loader ---
 
 # Change this to switch datasets
 ACTIVE_DATASET = DatasetType.FINEWEB_EDU
