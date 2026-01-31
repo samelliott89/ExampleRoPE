@@ -1,6 +1,7 @@
 # ExampleRoPE
 
-Minimal transformer implementation with modern techniques (LLaMA/Gemma-style). Trained on vast.ai with H100 GPUs.
+Started to extend previous work by adding influences from more modern techniques (LLaMA/Gemma-style). Began with RoPE but then added GQA, Muon, SwiGLU etc.
+Trained on vast.ai with H100 GPUs.
 
 ## Features
 
@@ -61,10 +62,10 @@ python inference.py --checkpoint checkpoints/model.pt --eval
 ```
 
 ## Example
-```
-Input: Once upon a time
-Output: in which the state of nature had been at its discretion and by which it was able to take his power into account. The following year, when he came back from England, there were fourteen thousand members who would have believed him but only thirty years later. He became the first man known as the great philosopher and writer of philosophy, whose views on all things are more than facts or ideas. His followers were so far not certain that they could be found out among themselves:
-```
+- Able to generate complete sentance structure around topics, but generally inaccurate around facts.
+
+- **Input**: Once upon a time...
+- **Output***: ...in which the state of nature had been at its discretion and by which it was able to take his power into account. The following year, when he came back from England, there were fourteen thousand members who would have believed him but only thirty years later. He became the first man known as the great philosopher and writer of philosophy, whose views on all things are more than facts or ideas. His followers were so far not certain that they could be found out among themselves:
 
 ## Files
 
@@ -72,4 +73,5 @@ Output: in which the state of nature had been at its discretion and by which it 
 - `inference.py` - Text generation and perplexity evaluation
 - `data.py` - FineWeb-Edu/Gutenberg dataset + GPT-2 BPE tokenizer
 - `optimizer.py` - Muon + AdamW optimizer
+
 
