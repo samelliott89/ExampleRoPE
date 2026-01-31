@@ -62,10 +62,10 @@ python inference.py --checkpoint checkpoints/model.pt --eval
 ```
 
 ## Example
-- Able to generate complete sentance structure around topics, but generally inaccurate around facts.
+- Able to generate complete sentance structure around themes, but facts are inaccurate and non-sensical. Would require much bigger datasets and longer training/model size.
 
 - **Input**: Once upon a time...
-- **Output***: ...in which the state of nature had been at its discretion and by which it was able to take his power into account. The following year, when he came back from England, there were fourteen thousand members who would have believed him but only thirty years later. He became the first man known as the great philosopher and writer of philosophy, whose views on all things are more than facts or ideas. His followers were so far not certain that they could be found out among themselves:
+- **Output**: ...in which the state of nature had been at its discretion and by which it was able to take his power into account. The following year, when he came back from England, there were fourteen thousand members who would have believed him but only thirty years later. He became the first man known as the great philosopher and writer of philosophy, whose views on all things are more than facts or ideas. His followers were so far not certain that they could be found out among themselves:
 
 ## Files
 
@@ -73,5 +73,6 @@ python inference.py --checkpoint checkpoints/model.pt --eval
 - `inference.py` - Text generation and perplexity evaluation
 - `data.py` - FineWeb-Edu/Gutenberg dataset + GPT-2 BPE tokenizer
 - `optimizer.py` - Muon + AdamW optimizer
+
 
 
